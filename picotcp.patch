@@ -1,0 +1,785 @@
+diff --git a/modules/pico_dev_tap.c b/modules/pico_dev_tap.c
+index 877941f4..03f1fd2b 100644
+--- a/modules/pico_dev_tap.c
++++ b/modules/pico_dev_tap.c
+@@ -19,6 +19,7 @@
+ #endif
+ 
+ #include <sys/poll.h>
++#include <ctype.h>
+ 
+ struct pico_device_tap {
+     struct pico_device dev;
+@@ -49,13 +50,768 @@ static int tap_link_state(__attribute__((unused)) struct pico_device *self)
+     return tapdev_link_state;
+ }
+ 
++void hexdump(unsigned char *data, size_t size) {
++        char ascii[17] = {0};
++        size_t i;
++
++        for (i = 0; i < size; ++i) {
++                unsigned char c = data[i];
++                size_t next = i+1;
++                printf("%02X ", c);
++                ascii[i % 16] = isprint(c) ? c : '.';
++                if (next % 8 == 0 || next == size) {
++                        printf(" ");
++                        if (next % 16 == 0) {
++                                printf("|  %s \n", ascii);
++                        } 
++
++                        else if (next == size) {
++                                size_t j;
++                                ascii[size % 16] = '\0';
++                                if (size % 16 <= 8) {
++                                        printf(" ");
++                                }
++                                for (j = size % 16; j < 16; ++j) {
++                                        printf("   "); 
++                                }
++                                printf("|  %s \n", ascii);
++                        }
++                }
++                fflush(stdout);
++        }
++}
+ 
+-static int pico_tap_send(struct pico_device *dev, void *buf, int len)
+-{
+-    struct pico_device_tap *tap = (struct pico_device_tap *) dev;
+-    return (int)write(tap->fd, buf, (uint32_t)len);
++
++struct eth_hdr {
++    uint8_t dst[6];
++    uint8_t src[6];
++    uint16_t type;
++} __attribute__((packed));
++
++
++struct ipv4_hdr {
++    uint8_t version_ihl;
++    uint8_t dscp_ecn;
++    uint16_t len;
++    uint16_t id;
++    uint16_t flags_offset;
++    uint8_t ttl;
++    uint8_t proto;
++    uint16_t checksum;
++    uint32_t src;
++    uint32_t dst;
++} __attribute__((packed));
++
++struct icmp4_hdr {
++    uint8_t type;
++    uint8_t code;
++    uint16_t checksum;
++    uint32_t rest;
++} __attribute__((packed));
++
++struct udp_hdr {
++    uint16_t src;
++    uint16_t dst;
++    uint16_t len;
++    uint16_t checksum;
++} __attribute__((packed));
++
++struct tcp_hdr {
++    uint16_t src;
++    uint16_t dst;
++    uint32_t seq;
++    uint32_t ack;
++    uint8_t offset;
++    uint8_t flags;
++    uint16_t window;
++    uint16_t checksum;
++    uint16_t urgent;
++} __attribute__((packed));
++
++void calc_icmp_checksum(struct ipv4_hdr *ipv4, struct icmp4_hdr *icmp, int len) {
++    icmp->checksum = 0;
++    unsigned int sum = 0;
++    unsigned int i;
++    unsigned char *p = (unsigned char *)icmp;
++
++    for (i = 0; i < len/2; i += 2) {
++        sum += (p[i] << 8) + p[i+1];
++    }
++
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++
++    icmp->checksum = ~sum;
++}
++
++unsigned char *fuzz_icmp4(unsigned char *b, int *len) {
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++    unsigned int ihl = (ipv4->version_ihl & 0x0f) * 4;
++    struct icmp4_hdr *icmp = (struct icmp4_hdr *)(b + sizeof(struct eth_hdr) + ihl );
++
++    if (!(rand() % 10)) {
++        *len -= rand() % *len;
++        printf("fuzzing icmp4 len\n");
++        if (*len > ihl + sizeof(struct eth_hdr)) {
++            calc_icmp_checksum(ipv4, icmp, *len - ihl - sizeof(struct eth_hdr));
++        }
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        icmp->type = rand() % 256;
++        printf("fuzzing icmp4 type\n");
++        calc_icmp_checksum(ipv4, icmp, *len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        icmp->code = rand() % 256;
++        printf("fuzzing icmp4 code\n");
++        calc_icmp_checksum(ipv4, icmp, *len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        icmp->checksum = rand() % 65536;
++        printf("fuzzing icmp4 checksum\n");
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        icmp->rest = rand() % 4294967296;
++        printf("fuzzing icmp4 rest\n");
++        calc_icmp_checksum(ipv4, icmp, *len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    return b;
++}
++
++unsigned char *fuzz_udp(unsigned char *b, int *len) {
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++    unsigned int ihl = (ipv4->version_ihl & 0x0f) * 4;
++    struct udp_hdr *udp = (struct udp_hdr *)(b + sizeof(struct eth_hdr) + ihl );
++
++    udp->checksum = 0;
++
++    if (!(rand() % 10)) {
++        *len -= rand() % *len;
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        udp->len = rand() % 65536;
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        udp->checksum = rand() % 65536;
++        return b;
++    }
++
++    return b;
++}
++
++void calc_tcp_checksum(struct ipv4_hdr *ipv4, struct tcp_hdr *tcp, int len) {
++
++    unsigned int ihl = (ipv4->version_ihl & 0x0f) * 4;
++    unsigned int tcp_len = len + sizeof(struct tcp_hdr);
++    unsigned int total_len = tcp_len + ihl;
++    unsigned int pseudo_len = tcp_len + 12;
++    unsigned char pseudo[pseudo_len];
++    unsigned int i;
++    unsigned int sum = 0;
++
++    tcp->checksum = 0;
++
++    uint32_t s = ipv4->src;
++    uint32_t d = ipv4->dst;
++
++    memcpy(pseudo, &s, 4);
++    memcpy(pseudo + 4, &d, 4);
++    pseudo[8] = 0;
++    pseudo[9] = ipv4->proto;
++    pseudo[10] = (tcp_len >> 8) & 0xff;
++    pseudo[11] = tcp_len & 0xff;
++    memcpy(pseudo + 12, tcp, tcp_len);
++
++    for (i = 0; i < pseudo_len; i += 2) {
++        sum += (pseudo[i] << 8) + pseudo[i+1];
++    }
++
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++
++    tcp->checksum = ~sum;
++}
++
++unsigned char *fuzz_tcp_options_mutate(unsigned char *b, int *len){
++    return b;
++}
++
++unsigned int well_known_tcp_options[] = {
++    2,3,4,5, 8, 16, 17, 34
++};
++
++unsigned int well_known_ip_options[] = {
++    0, 1, 7, 10, 11, 12, 15, 25, 30, 68, 94,  
++    130, 131, 133, 134, 136, 137, 142, 144, 145, 147, 148, 149, 151, 152, 158, 
++    205, 222
++};
++
++int gen_ip_opt_nr() {
++    if (!(rand() % 4)) {
++        // return well known options
++        return well_known_ip_options[rand() % (sizeof(well_known_ip_options) / sizeof(unsigned int))];
++    }
++
++    return rand() % 256;
++}
++
++int gen_tcp_opt_nr() {
++    if (!(rand() % 4)) {
++        // return well known options
++        return well_known_tcp_options[rand() % (sizeof(well_known_tcp_options) / sizeof(unsigned int))];
++    }
++
++    if (rand() % 10)
++        return rand() % 35;
++    else 
++        return rand() % 256;
++
++    return 0;
++}
++
++// -1 is either unspecified or dynamic
++// see https://www.iana.org/assignments/tcp-parameters/tcp-parameters.xhtml
++int known_options_len[] = {
++    2,
++    2,
++    4,
++    3,
++    2,
++    -1, 
++    6,
++    6,
++    10, 
++    2,
++    3,
++    -1,-1,-1, 
++    3, 
++    -1, -1, -1, 
++    3, 
++    18, 
++    -1, -1, -1, -1, -1, -1, -1,
++    8, 
++    4, 
++    -1, -1, -1, -1, -1, -1
++};
++
++int gen_option_len(int o){
++    if (o > 34) {
++        if (rand() % 10) {
++            return rand() % 38 + 2;
++        } else {
++            return rand() % 40;
++        }
++    }
++
++    int olen = known_options_len[o];
++    if (olen == -1 || !(rand() % 10) ) {
++        if (rand() % 10) {
++            return rand() % 38 + 2;
++        } else {
++            return rand() % 40;
++        }
++    }
++
++    return olen;
++
++}
++
++unsigned char *generate_tcp_options(unsigned int *len) {
++    unsigned int olen = rand() % 40  + 1;
++    static char obuf[40];
++    unsigned char *o = obuf;
++    unsigned int i;
++
++    if (olen % 4)
++        olen += 4 - (olen % 4);
++
++    int nr_options = rand() % 10;
++
++    int olen_avail = olen;
++    char *olen_cur_ptr = o;
++
++    for (i = 0; i < nr_options; i++) {
++
++        if (olen_avail < 2) {
++            break;
++        }
++
++        int opt_nr = gen_tcp_opt_nr();
++        int opt_len = gen_option_len(opt_nr);
++        if (opt_len > olen_avail) {
++            opt_len = olen_avail;
++        }
++
++        olen_cur_ptr[0] = opt_nr;
++        olen_cur_ptr[1] = opt_len;
++        olen_cur_ptr += 2;
++        olen_avail -= 2;
++
++        if (opt_len > 2) {
++            int j;
++            for (j = 0; j < opt_len - 2; j++) {
++                olen_cur_ptr[j] = rand() % 256;
++            }
++            olen_cur_ptr += opt_len - 2;
++            olen_avail -= opt_len - 2;
++        }
++
++    }
++
++    *len = olen;
++    return o;
++}
++
++unsigned char *fuzz_tcp_options(unsigned char *b, int *len) {
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++    unsigned int ihl = (ipv4->version_ihl & 0x0f) * 4;
++    struct tcp_hdr *tcp = (struct tcp_hdr *)(b + sizeof(struct eth_hdr) + ihl );
++
++    int original_len = *len;
++
++    unsigned int tcp_len = original_len - ihl - sizeof(struct eth_hdr);
++    unsigned int options_len = tcp->offset * 4 - sizeof(struct tcp_hdr);
++
++    if (options_len != 0) {
++        return fuzz_tcp_options_mutate(b, len);
++    }
++
++    unsigned int olen = 0;
++    unsigned char *o = generate_tcp_options(&olen); 
++    printf("fuzzing tcp options\n");
++    unsigned char *p = malloc(original_len + olen + 100);
++
++    memcpy(p, b, sizeof(struct eth_hdr) + ihl + sizeof(struct tcp_hdr));
++    memcpy(p + sizeof(struct eth_hdr) + ihl + sizeof(struct tcp_hdr), o, olen);
++    memcpy(p + sizeof(struct eth_hdr) + ihl + sizeof(struct tcp_hdr) + olen, 
++        b + sizeof(struct eth_hdr) + ihl + sizeof(struct tcp_hdr), 
++        original_len - ihl - sizeof(struct eth_hdr) - sizeof(struct tcp_hdr));
++
++    *len = original_len + olen;
++
++    ipv4 = (struct ipv4_hdr *)(p + sizeof(struct eth_hdr));
++    ihl = (ipv4->version_ihl & 0x0f) * 4;
++    tcp = (struct tcp_hdr *)(p + sizeof(struct eth_hdr) + ihl );
++    tcp->offset = (sizeof(struct tcp_hdr) + olen) / 4;
++    calc_tcp_checksum(ipv4, tcp, *len - ihl - sizeof(struct eth_hdr));
++    // need to signal allocation (msb of len?) so we can avoid leaks
++    return p;
++
++}
++
++uint32_t delta(uint32_t v) {
++    if (rand() % 10) {
++        if (rand() % 2) {
++            return v + rand() % 100;
++        } else {
++            return v - rand() % 100;
++        }
++    } else {
++        return rand() % 4294967296;
++    }
++    return v;
++}
++
++uint16_t delta16(uint16_t v) {
++    if (rand() % 10) {
++        if (rand() % 2) {
++            return v + rand() % 10;
++        } else {
++            return v - rand() % 10;
++        }
++    } else {
++        return rand() % 65536;
++    }
++    return v;
++}
++
++uint8_t delta8(uint8_t v) {
++    if (rand() % 10) {
++        if (rand() % 2) {
++            return v + rand() % 10;
++        } else {
++            return v - rand() % 10;
++        }
++    } else {
++        return rand() % 256;
++    }
++    return v;
++}
++
++unsigned char *fuzz_tcp(unsigned char *b, int *len) {
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++    unsigned int ihl = (ipv4->version_ihl & 0x0f) * 4;
++    struct tcp_hdr *tcp = (struct tcp_hdr *)(b + sizeof(struct eth_hdr) + ihl );
++
++    int original_len = *len;
++
++
++    if (!(rand() % 10)) {
++        return fuzz_tcp_options(b, len);
++    }
++
++    if (!(rand() % 10)) {
++        *len -= rand() % *len;
++        return b;
++    }
++
++
++    if (!(rand() % 10)) {
++        tcp->seq = delta(tcp->seq);
++        printf("fuzzing seq\n");
++        calc_tcp_checksum(ipv4, tcp, original_len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        tcp->ack = delta(tcp->ack);
++        printf("fuzzing ack\n");
++        calc_tcp_checksum(ipv4, tcp, original_len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        tcp->offset = delta8(tcp->offset);
++        printf("fuzzing offset\n");
++        calc_tcp_checksum(ipv4, tcp, original_len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        tcp->flags = rand() % 256;
++        printf("fuzzing flags\n");
++        calc_tcp_checksum(ipv4, tcp, original_len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        tcp->window = delta16(tcp->window);
++        printf("fuzzing window\n");
++        calc_tcp_checksum(ipv4, tcp, original_len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        tcp->checksum = rand() % 65536;
++        printf("fuzzing checksum\n");
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        tcp->urgent = rand() % 65536;
++        printf("fuzzing urgent\n");
++        calc_tcp_checksum(ipv4, tcp, original_len - ihl - sizeof(struct eth_hdr));
++        return b;
++    }
++
++    return b;
++}
++
++unsigned char* fuzz_ipv4_options_mutate(unsigned char *b, int *len) {
++    return b;
+ }
+ 
++void calc_ip_checksum_ihl(struct ipv4_hdr *ipv4) {
++    ipv4->checksum = 0;
++    unsigned int sum = 0;
++    unsigned int i;
++    unsigned char *p = (unsigned char *)ipv4;
++
++    unsigned int len = 20;
++
++    for (i = 0; i < len/2; i += 2) {
++        sum += (p[i] << 8) + p[i+1];
++    }
++
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++
++    ipv4->checksum = ~sum;
++}
++
++void calc_ip_checksum(struct ipv4_hdr *ipv4) {
++    ipv4->checksum = 0;
++    unsigned int sum = 0;
++    unsigned int i;
++    unsigned char *p = (unsigned char *)ipv4;
++
++    unsigned int len = (ipv4->version_ihl & 0x0f) * 4;
++
++    for (i = 0; i < len/2; i += 2) {
++        sum += (p[i] << 8) + p[i+1];
++    }
++
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++
++    ipv4->checksum = ~sum;
++}
++
++int gen_ip_option_len(int o){
++    int olen = 2;
++    if (rand() % 10) {
++        olen += rand() % 18;
++    }
++    return olen;
++
++}
++
++
++unsigned char *generate_ipv4_options(int *olen) {
++    unsigned int olen2 = rand() % 20 + 1;
++    static unsigned char obuf[20];
++    unsigned char *o = obuf;
++    unsigned int i;
++
++    if (olen2 % 4)
++        olen2 += 4 - (olen2 % 4);
++
++    int nr_options = rand() % 5;
++
++    int olen_avail = olen2;
++    char *olen_cur_ptr = o;
++
++    for (i = 0; i < nr_options; i++) {
++
++        if (olen_avail < 2) {
++            break;
++        }
++
++        int opt_nr = gen_ip_opt_nr();
++        int opt_len = gen_ip_option_len(opt_nr);
++        if (opt_len > olen_avail) {
++            opt_len = olen_avail;
++        }
++
++        olen_cur_ptr[0] = opt_nr;
++        olen_cur_ptr[1] = opt_len;
++        olen_cur_ptr += 2;
++        olen_avail -= 2;
++
++        if (opt_len > 2) {
++            int j;
++            for (j = 0; j < opt_len - 2; j++) {
++                olen_cur_ptr[j] = rand() % 256;
++            }
++            olen_cur_ptr += opt_len - 2;
++            olen_avail -= opt_len - 2;
++        }
++
++    }
++
++    *olen = olen2;
++    return o;
++}
++
++unsigned char* fuzz_ipv4_options(unsigned char *b, int *len) {
++
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++    unsigned int ihl = (ipv4->version_ihl & 0x0f) * 4;
++    unsigned int options_len = ihl - sizeof(struct ipv4_hdr);
++    unsigned int options_offset = sizeof(struct eth_hdr) + sizeof(struct ipv4_hdr);
++
++    if (options_len != 0) {
++        fuzz_ipv4_options_mutate(b, len);
++        return b;
++    }
++
++    unsigned int olen = 0;
++    unsigned char *o = generate_ipv4_options(&olen);
++
++    printf("fuzzing ipv4 options\n");
++
++    unsigned char *p = malloc(*len + olen + 100);
++
++    memcpy(p, b, options_offset);
++    memcpy(p + options_offset, o, olen);
++    memcpy(p + options_offset + olen, b + options_offset, *len - options_offset);
++
++    eth = (struct eth_hdr *)p;
++    ipv4 = (struct ipv4_hdr *)(p + sizeof(struct eth_hdr));
++
++    ipv4->version_ihl = 0x40 | ((sizeof(struct ipv4_hdr) + olen) / 4);
++
++    calc_ip_checksum(ipv4);
++
++    // signal allocation to caller
++
++    return p;
++
++
++}
++
++unsigned char *fuzz_ipv4_header(unsigned char *b, int *len) {
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++
++    if (!(rand() % 10)) {
++        *len -= rand() % *len;
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->version_ihl = rand() % 256;
++        printf("fuzzing ipv4 version_ihl\n");
++        calc_ip_checksum_ihl(ipv4);
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->dscp_ecn = rand() % 256;
++        printf("fuzzing ipv4 dscp_ecn\n");
++        calc_ip_checksum(ipv4);
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->len = rand() % 65536;
++        printf("fuzzing ipv4 len\n");
++        calc_ip_checksum(ipv4);
++
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->id = rand() % 65536;
++        printf("fuzzing ipv4 id\n");
++        calc_ip_checksum(ipv4);
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->flags_offset = rand() % 65536;
++        printf("fuzzing ipv4 flags_offset\n");
++        calc_ip_checksum(ipv4);
++
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->ttl = rand() % 256;
++        printf("fuzzing ipv4 ttl\n");
++        calc_ip_checksum(ipv4);
++
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->proto = rand() % 256;
++        printf("fuzzing ipv4 proto\n");
++        calc_ip_checksum(ipv4);
++        return b;
++    }
++
++    if (!(rand() % 10)) {
++        ipv4->checksum = rand() % 65536;
++        printf("fuzzing ipv4 checksum\n");
++        return b;
++    }
++
++    return b;
++
++}
++
++unsigned char* fuzz_ipv4(unsigned char *b, int *len) {
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++    struct ipv4_hdr *ipv4 = (struct ipv4_hdr *)(b + sizeof(struct eth_hdr));
++
++    if (!(rand() % 10)) {
++        return fuzz_ipv4_options(b, len);
++    }
++
++    if (!(rand() % 10)) {
++        return fuzz_ipv4_header(b, len);
++        return b;
++    }
++
++    if (ipv4->proto == PICO_PROTO_ICMP4) {
++        return fuzz_icmp4(b, len);
++    }
++
++    if (ipv4->proto == PICO_PROTO_UDP) {
++        return fuzz_udp(b, len);
++    }
++
++    if (ipv4->proto == PICO_PROTO_TCP) {
++        return fuzz_tcp(b, len);
++    }
++
++    return b;
++}
++
++// XXX TODO
++unsigned char *fuzz_ipv6(unsigned char *b, int *len) {
++    return b;
++}
++
++unsigned char* fuzz(unsigned char *b, int *len) {
++
++    // don't touch half of the packets
++    if (rand() % 2) 
++        return b;
++
++    struct eth_hdr *eth = (struct eth_hdr *)b;
++
++    if (eth->type == 0x0008)
++        return fuzz_ipv4(b, len);
++    
++    if (eth->type == 0xdd86)
++        return fuzz_ipv6(b, len);
++
++    if (!(rand()%10)) {
++        *len -= rand() % *len;
++        return b;
++    }
++
++    return b;
++}
++ 
++ static int pico_tap_send(struct pico_device *dev, void *buf, int len)
++ {
++     struct pico_device_tap *tap = (struct pico_device_tap *) dev;
++//   return (int)write(tap->fd, buf, (uint32_t)len);
++
++//    hexdump(buf, len);
++
++    unsigned char *b = fuzz(buf, &len);
++
++    int need_free = len & 0x80000000;
++    len &= 0x7fffffff;
++
++    int r = (int)write(tap->fd, b, (uint32_t)len);
++
++    if (need_free) {
++        free(b);
++    }
++
++    return r;
++ }
++ 
++
++
+ static int pico_tap_poll(struct pico_device *dev, int loop_score)
+ {
+     struct pico_device_tap *tap = (struct pico_device_tap *) dev;
