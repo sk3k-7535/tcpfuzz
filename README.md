@@ -35,3 +35,4 @@
 Question: 
 - why do I get so many `./fuzz.sh: line 3: ./echotc.elf: Permission denied`?
 - how to read the actual package content and what happens with it / should happen with it? (framework)
+	- does it really fuzz?
